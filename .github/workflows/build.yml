@@ -1,0 +1,82 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['*']
+    paths-ignore: [LICENSE, README.md, THIRD_PARTY_NOTICES.md]
+  pull_request:
+    branches: [main, master]
+    paths-ignore: [LICENSE, README.md, THIRD_PARTY_NOTICES.md]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux i386
+    # Keep the release glibc requirement compatible with Ubuntu 24.04 servers.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y g++-multilib binutils
+
+      - name: Check out SourceMod 1.12
+        uses: actions/checkout@v7
+        with:
+          repository: alliedmodders/sourcemod
+          ref: 3f7460671f7adc4a3c6791a47d21ba3e7b5fba91
+          submodules: recursive
+          persist-credentials: false
+          path: sourcemod
+
+      - name: Check out verified SafetyHook revision
+        working-directory: sourcemod/public/safetyhook
+        # Match the dependency revision used for the local extension validation.
+        run: |
+          git fetch --depth=1 origin 4c933195789e9a0551a49c929dc3a2dd1e8fb97f
+          git checkout --detach 4c933195789e9a0551a49c929dc3a2dd1e8fb97f
+
+      - name: Check out extension
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: src
+
+      - name: Build and test
+        working-directory: src
+        # --logic requires the separately supplied, exact supported server binary.
+        run: python3 build.py --sourcemod ../sourcemod --test
+
+      - name: Verify Linux binary and package
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          import subprocess
+
+          package = Path('build/package/addons/sourcemod')
+          extension_binary = package / 'extensions/autoload_plugin_denylist.ext.so'
+          with extension_binary.open('rb') as extension_file:
+              header = extension_file.read(20)
+          assert header[:6] == b'\x7fELF\x01\x01', 'Expected a little-endian ELF32 binary'
+          assert struct.unpack_from('<H', header, 16)[0] == 3, 'Expected a shared object'
+          assert struct.unpack_from('<H', header, 18)[0] == 3, 'Expected Intel i386'
+          symbol_output = subprocess.check_output(
+              ['nm', '-D', '--defined-only', str(extension_binary)], text=True)
+          exported_symbols = [line.split()[-1] for line in symbol_output.splitlines() if line.strip()]
+          assert exported_symbols == ['GetSMExtAPI'], exported_symbols
+          assert (package / 'extensions/autoload_plugin_denylist.autoload').is_file()
+          assert (package / 'configs/autoload_plugin_denylist.cfg').is_file()
+          print('Verified Linux i386 extension, SourceMod entry point, autoload marker, and config')
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: smx-autoload-denylist-linux-i386-${{ github.sha }}
+          path: src/build/package
+          if-no-files-found: error
