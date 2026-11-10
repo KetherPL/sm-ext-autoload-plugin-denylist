@@ -20,6 +20,10 @@ Output: `build/package/addons/sourcemod/`. `--logic` is optional and used only w
 the target, installs a temporary detour, and verifies restoration. It does not
 connect to or modify a running server or change the input binary on disk.
 
+The default build omits debug information and strips the extension binary. Pass
+`--debug` to include debug symbols and keep the binary unstripped. Both modes use
+the same `-O2` optimization level.
+
 `CC` and `CXX` select compilers. `--output` selects the build directory. Rebuilding
 overwrites the sample config in the output package; maintain deployment edits in
 the server's config. The locally built extension requires 32-bit glibc 2.38 or

@@ -13,6 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sourcemod", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("build"))
+    parser.add_argument("--debug", action="store_true", help="Include debug symbols and leave the extension unstripped")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--logic", type=Path, help="With --test, validate and temporarily detour this logic binary in a standalone test process")
     arguments = parser.parse_args()
@@ -29,8 +30,10 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     compiler = os.environ.get("CXX", "g++")
     c_compiler = os.environ.get("CC", "gcc")
-    common_flags = ["-m32", "-O2", "-g", "-fPIC", "-fvisibility=hidden",
+    common_flags = ["-m32", "-O2", "-fPIC", "-fvisibility=hidden",
                     "-D_LINUX", "-DPOSIX", "-pthread"]
+    if arguments.debug:
+        common_flags.append("-g")
     include_flags = [f"-I{directory}" for directory in includes]
     cpp_flags = ["-std=c++17", "-fno-gnu-unique", "-Wall", "-Wextra", "-Wno-unused-parameter"]
     objects = []
@@ -54,6 +57,7 @@ def main():
     library = extensions / "autoload_plugin_denylist.ext.so"
     subprocess.run([compiler, "-m32", "-shared", *objects, "-ldl", "-pthread",
                     "-Wl,-z,defs,-z,relro,-z,now", f"-Wl,--version-script={exports}",
+                    *([] if arguments.debug else ["-Wl,--strip-all"]),
                     "-o", str(library)], check=True)
     (extensions / "autoload_plugin_denylist.autoload").write_text("")
     configs = package / "configs"
