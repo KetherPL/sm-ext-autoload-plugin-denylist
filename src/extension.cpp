@@ -24,8 +24,13 @@ void FilterAutomaticCall(safetyhook::Context &context)
 	assert(target.resume_address);
 	try
 	{
-		if (AutoloadDenylist::FilterScanCall(context, denylist, target.resume_address))
-			smutils->LogMessage(myself, "Skipped automatic plugin load: %s", AutoloadDenylist::ScanPluginPath(context));
+		AutoloadDenylist::ScanPathBuffer plugin_path;
+		const auto result = AutoloadDenylist::FilterScanCall(context, denylist, target.resume_address, plugin_path);
+		if (result == AutoloadDenylist::ScanFilterResult::Denied)
+			smutils->LogMessage(myself, "Skipped automatic plugin load: %s", plugin_path.data());
+		else if (result == AutoloadDenylist::ScanFilterResult::InvalidPath)
+			smutils->LogError(myself, "Skipped automatic plugin load: unreadable candidate path or no terminator within %zu bytes",
+				plugin_path.size());
 	}
 	catch (const std::exception &exception)
 	{
@@ -75,6 +80,14 @@ private:
 				? textparsers->GetSMCErrorString(parse_result) : denylist.Error().c_str();
 			std::snprintf(error, maxlength, "Config error at %u:%u: %s", states.line, states.col,
 				message ? message : "Missing or incomplete AutoloadPluginDenylist section");
+			return false;
+		}
+
+		AutoloadDenylist::ScanPathBuffer reader_probe;
+		constexpr char kReaderProbe[] = "autoload_plugin_denylist.smx";
+		if (!AutoloadDenylist::ReadScanPluginPath(reinterpret_cast<uintptr_t>(kReaderProbe), reader_probe))
+		{
+			std::snprintf(error, maxlength, "Safe path reader (process_vm_readv) is unavailable or blocked; no hook installed");
 			return false;
 		}
 

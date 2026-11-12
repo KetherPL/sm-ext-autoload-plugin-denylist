@@ -123,6 +123,19 @@ SourceMod to clean up its argument stack and continue scanning. The internal loa
 itself is unchanged, so explicit and dependency loads remain available. Unloading
 this extension restores the original call instruction.
 
+Structural argument checks do not prove how the path register was populated.
+Before matching or logging, the callback uses Linux `process_vm_readv` on its own
+process to copy the candidate into an owned buffer, one page at a time, with a
+4 KiB total bound. Unreadable or unterminated candidates are logged and skipped
+without calling the loader. Normalization and skipped-path logging use only the
+copied, terminated string. No memory-map cache or signal handler is required.
+The copy protects the callback's reads; it does not establish the semantic origin
+of a readable string or guarantee its lifetime after an allowed call resumes.
+
+The server must permit `process_vm_readv`. A startup probe checks reader
+availability before hook installation; if the syscall is unavailable or blocked,
+the extension reports an initialization error and does not install the hook.
+
 This remains a conservative machine-code validator, not a guarantee for arbitrary
 future compilers or SourceMod internals. Unrecognized stack layouts, result dispatch,
 missing/stripped symbols, ambiguous calls, file/image mismatch, malformed config,
@@ -144,6 +157,10 @@ reuse, actual SourceMod SMC parsing, checked address arithmetic, and bounded GNU
 build-ID parsing. Executable i386 fixtures check runtime call discovery, rejection
 of altered arguments and result handling, both observed argument counts, unchanged
 allowed-call context, automatic filtering, manual-load isolation, and restoration.
+Path-reader tests cover inaccessible and unmapped memory, page-boundary strings,
+unterminated and maximum-length candidates, and owned-copy independence. An
+executable scanner fixture with path register value 1 verifies safe rejection
+even when the structural verifier accepts that scanner.
 
 Use repeated `--logic /path/to/sourcemod.logic.so` arguments with `--test` to check
 multiple binaries in separate standalone processes. These tests use the same ELF

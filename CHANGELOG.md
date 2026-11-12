@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Copy scan candidates into an owned, bounded buffer with Linux
+  `process_vm_readv` before matching or logging. Unreadable and unterminated
+  candidates are skipped safely; startup rejects an unavailable or blocked
+  reader. Added page-boundary, inaccessible-memory, length-limit, and executable
+  invalid-path-register regression tests.
 - Replaced the build-specific internal-loader detour with a mid-function hook at
   the automatically discovered directory-scan call. Compatible updates no longer
   require a new compiled build ID, loader entry signature, or scan offset.

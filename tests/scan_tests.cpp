@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <sys/mman.h>
 
 using namespace AutoloadDenylist;
 namespace
@@ -14,12 +15,15 @@ Denylist denylist;
 uintptr_t resume_address;
 int loader_calls = 0;
 int iterator_calls = 0;
+int invalid_paths = 0;
 void *last_manager = nullptr;
 std::string last_plugin;
 
 void Filter(safetyhook::Context &context)
 {
-	FilterScanCall(context, denylist, resume_address);
+	ScanPathBuffer plugin_path;
+	if (FilterScanCall(context, denylist, resume_address, plugin_path) == ScanFilterResult::InvalidPath)
+		invalid_paths++;
 }
 
 extern "C" int FixtureThree(void *manager, void **result, const char *plugin)
@@ -40,13 +44,14 @@ extern "C" int FixtureFour(void *manager, void **result, const char *plugin, uns
 extern "C" void FixtureNext(void *) { iterator_calls++; }
 extern "C" int ScanThree(void *, void **, const char *, void *);
 extern "C" int ScanFour(void *, void **, const char *, void *);
-extern "C" char ScanThreeEnd, ScanFourEnd;
+extern "C" int ScanInvalid(void *, void **, const char *, void *);
+extern "C" char ScanThreeEnd, ScanFourEnd, ScanInvalidEnd;
 
 // Model the public IDirectory::NextEntry call and SourceMod's result dispatch.
-#define SCANNER(name, loader, reservation, extra) \
+#define SCANNER(name, loader, reservation, extra, path_setup) \
 asm(".text\n.global " #name "\n.type " #name ",@function\n" #name ":\n" \
 	"push %ebp\nmov %esp,%ebp\npush %esi\npush %edi\nsub $16,%esp\n" \
-	"mov 16(%ebp),%edi\nmov 20(%ebp),%esi\njmp " #name "Setup\n" \
+	path_setup "mov 20(%ebp),%esi\njmp " #name "Setup\n" \
 	#name "Iterate:\nmov (%esi),%eax\nsub $12,%esp\npush %esi\ncall *12(%eax)\nadd $16,%esp\n" \
 	"mov $3,%eax\njmp " #name "Done\n" \
 	#name "Setup:\nmovl $0,-12(%ebp)\nsub $" #reservation ",%esp\n" extra \
@@ -55,8 +60,9 @@ asm(".text\n.global " #name "\n.type " #name ",@function\n" #name ":\n" \
 	"mov -12(%ebp),%eax\nmov 12(%ebp),%edx\nmov %eax,(%edx)\nxor %eax,%eax\njmp " #name "Done\n" \
 	#name "Failure:\nmov $2,%eax\n" #name "Done:\nadd $16,%esp\npop %edi\npop %esi\nleave\nret\n" \
 	".global " #name "End\n" #name "End:\n.size " #name ",.-" #name "\n");
-SCANNER(ScanThree, FixtureThree, 20, "")
-SCANNER(ScanFour, FixtureFour, 16, "push $0\n")
+SCANNER(ScanThree, FixtureThree, 20, "", "mov 16(%ebp),%edi\n")
+SCANNER(ScanFour, FixtureFour, 16, "push $0\n", "mov 16(%ebp),%edi\n")
+SCANNER(ScanInvalid, FixtureThree, 20, "", "mov $1,%edi\n")
 #undef SCANNER
 
 using Scanner = int (*)(void *, void **, const char *, void *);
@@ -83,11 +89,59 @@ void TestContext()
 	std::memset(&context, 0xa5, sizeof(context));
 	context.esp = reinterpret_cast<uintptr_t>(arguments);
 	const auto original = context;
-	assert(!FilterScanCall(context, denylist, 1));
+	ScanPathBuffer plugin_path;
+	assert(FilterScanCall(context, denylist, 1, plugin_path) == ScanFilterResult::Allowed);
+	assert(std::strcmp(plugin_path.data(), "allowed.smx") == 0);
 	assert(std::memcmp(&context, &original, sizeof(context)) == 0);
 	arguments[2] = reinterpret_cast<uintptr_t>("blocked.smx");
-	assert(FilterScanCall(context, denylist, 1));
+	assert(FilterScanCall(context, denylist, 1, plugin_path) == ScanFilterResult::Denied);
 	assert(context.eax == kLoadNeverLoad && context.eip == 1 && context.esp == original.esp);
+	for (uintptr_t invalid : {uintptr_t(0), uintptr_t(1), UINTPTR_MAX})
+	{
+		context = original;
+		arguments[2] = invalid;
+		assert(FilterScanCall(context, denylist, 1, plugin_path) == ScanFilterResult::InvalidPath);
+		assert(context.eax == kLoadNeverLoad && context.eip == 1 && context.esp == original.esp);
+		assert(plugin_path[0] == '\0');
+	}
+}
+
+void TestPathReader()
+{
+	ScanPathBuffer plugin_path;
+	const long page_size_result = sysconf(_SC_PAGESIZE);
+	assert(page_size_result > 0);
+	const size_t page_size = static_cast<size_t>(page_size_result);
+	assert(page_size >= plugin_path.size());
+	const size_t mapping_size = page_size * 3;
+	auto *pages = static_cast<char *>(mmap(nullptr, mapping_size, PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+	assert(pages != MAP_FAILED);
+	assert(mprotect(pages + page_size * 2, page_size, PROT_NONE) == 0);
+	char *boundary_path = pages + page_size * 2 - sizeof("edge.smx");
+	std::memcpy(boundary_path, "edge.smx", sizeof("edge.smx"));
+	assert(ReadScanPluginPath(reinterpret_cast<uintptr_t>(boundary_path), plugin_path));
+	assert(std::strcmp(plugin_path.data(), "edge.smx") == 0);
+	assert(mprotect(pages + page_size, page_size, PROT_NONE) == 0);
+	assert(std::strcmp(plugin_path.data(), "edge.smx") == 0); // The owned copy remains usable.
+	assert(!ReadScanPluginPath(reinterpret_cast<uintptr_t>(boundary_path), plugin_path));
+	assert(mprotect(pages + page_size, page_size, PROT_READ | PROT_WRITE) == 0);
+	char *crossing_path = pages + page_size - 3;
+	std::memcpy(crossing_path, "cross.smx", sizeof("cross.smx"));
+	assert(ReadScanPluginPath(reinterpret_cast<uintptr_t>(crossing_path), plugin_path));
+	assert(std::strcmp(plugin_path.data(), "cross.smx") == 0);
+	std::memset(pages, 'a', page_size * 2);
+	pages[plugin_path.size()] = '\0';
+	assert(!ReadScanPluginPath(reinterpret_cast<uintptr_t>(pages), plugin_path));
+	pages[kMaxRelativePath] = '\0';
+	assert(ReadScanPluginPath(reinterpret_cast<uintptr_t>(pages), plugin_path));
+	assert(std::strlen(plugin_path.data()) == kMaxRelativePath);
+	assert(!ReadScanPluginPath(reinterpret_cast<uintptr_t>(pages + page_size * 2 - 2), plugin_path));
+	assert(plugin_path[0] == '\0');
+	assert(!ReadScanPluginPath(reinterpret_cast<uintptr_t>(pages + page_size * 2), plugin_path));
+	const uintptr_t unmapped = reinterpret_cast<uintptr_t>(pages);
+	assert(munmap(pages, mapping_size) == 0);
+	assert(!ReadScanPluginPath(unmapped, plugin_path));
 }
 
 void TestDiscoveryFailures(TargetCheck verified)
@@ -182,13 +236,37 @@ void TestScanner(Scanner scanner, const void *end, void *loader)
 	assert(std::memcmp(original.data(), target.scanner, original.size()) == 0);
 	assert(scanner(&manager, &result, "blocked.smx", &iterator) == 0 && loader_calls == 3);
 }
+
+void TestInvalidScanner()
+{
+	TargetCheck target{reinterpret_cast<void *>(&FixtureThree), reinterpret_cast<unsigned char *>(&ScanInvalid),
+		reinterpret_cast<uintptr_t>(&ScanInvalidEnd) - reinterpret_cast<uintptr_t>(&ScanInvalid)};
+	std::string error;
+	// Structural acceptance alone does not establish the path register's provenance.
+	assert(ValidateScanCode(target, error));
+	resume_address = target.resume_address;
+	auto created = safetyhook::MidHook::create(target.call, &Filter, safetyhook::MidHook::StartDisabled);
+	assert(created);
+	auto hook = std::move(created.value());
+	assert(hook.enable());
+	std::array<void *, 4> vtable{nullptr, nullptr, nullptr, reinterpret_cast<void *>(&FixtureNext)};
+	void *iterator = vtable.data();
+	int manager = 0;
+	void *result = nullptr;
+	loader_calls = iterator_calls = invalid_paths = 0;
+	assert(ScanInvalid(&manager, &result, "ignored.smx", &iterator) == kLoadNeverLoad);
+	assert(loader_calls == 0 && iterator_calls == 1 && invalid_paths == 1);
+	hook.reset();
+}
 }
 
 int main()
 {
 	InitializeDenylist();
+	TestPathReader();
 	TestContext();
 	TestScanner(&ScanThree, &ScanThreeEnd, reinterpret_cast<void *>(&FixtureThree));
 	TestScanner(&ScanFour, &ScanFourEnd, reinterpret_cast<void *>(&FixtureFour));
+	TestInvalidScanner();
 	std::puts("Runtime discovery, rejection, three/four-argument filtering, manual loads, and mid-hook restoration passed");
 }
