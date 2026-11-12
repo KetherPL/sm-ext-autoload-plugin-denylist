@@ -123,6 +123,13 @@ private:
 		}
 		hook = std::move(created.value());
 		original_load_plugin = hook.original<InternalLoadPlugin>();
+		if (!original_load_plugin)
+		{
+			hook.reset();
+			scan_return_address = nullptr;
+			std::snprintf(error, maxlength, "Cannot enable LoadPlugin detour: trampoline is null");
+			return false;
+		}
 		scan_return_address = check.scan_return_address;
 		const auto enabled = hook.enable();
 		if (!enabled)

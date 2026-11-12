@@ -80,6 +80,126 @@ void TestListener()
 	assert(config.ReadSMC_NewSection(nullptr, "Plugins") == SMCResult_HaltFail);
 }
 
+void TestParserReuse()
+{
+	Denylist config;
+	for (bool fail_parse : {false, true})
+	{
+		config.ReadSMC_ParseStart();
+		config.ReadSMC_NewSection(nullptr, "AutoloadPluginDenylist");
+		config.ReadSMC_NewSection(nullptr, "Directories");
+		assert(config.ReadSMC_KeyValue(nullptr, "old", "1") == SMCResult_Continue);
+		if (fail_parse)
+		{
+			assert(config.ReadSMC_NewSection(nullptr, "Invalid") == SMCResult_HaltFail);
+			config.ReadSMC_ParseEnd(true, true);
+		} else {
+			config.ReadSMC_LeavingSection(nullptr);
+			config.ReadSMC_LeavingSection(nullptr);
+			config.ReadSMC_ParseEnd(false, false);
+			assert(config.IsComplete());
+		}
+		config.ReadSMC_ParseStart();
+		assert(config.Error().empty() && !config.IsComplete());
+		assert(config.PluginCount() == 0 && config.DirectoryCount() == 0);
+		config.ReadSMC_NewSection(nullptr, "AutoloadPluginDenylist");
+		config.ReadSMC_NewSection(nullptr, "Plugins");
+		assert(config.ReadSMC_KeyValue(nullptr, "new.smx", "1") == SMCResult_Continue);
+		config.ReadSMC_LeavingSection(nullptr);
+		config.ReadSMC_LeavingSection(nullptr);
+		config.ReadSMC_ParseEnd(false, false);
+		assert(config.IsComplete() && config.Blocks("new.smx"));
+		assert(!config.Blocks("new.smx/nested.smx") && !config.Blocks("old/a.smx"));
+	}
+}
+
+void TestConfigLimits()
+{
+	Denylist config;
+	config.ReadSMC_ParseStart();
+	config.ReadSMC_NewSection(nullptr, "AutoloadPluginDenylist");
+	config.ReadSMC_NewSection(nullptr, "Directories");
+	for (size_t index = 0; index < kMaxDenylistEntries - 1; index++)
+	{
+		const std::string path = "directory" + std::to_string(index);
+		assert(config.ReadSMC_KeyValue(nullptr, path.c_str(), "1") == SMCResult_Continue);
+	}
+	config.ReadSMC_LeavingSection(nullptr);
+	config.ReadSMC_NewSection(nullptr, "Plugins");
+	assert(config.ReadSMC_KeyValue(nullptr, "last.smx", "1") == SMCResult_Continue);
+	assert(config.PluginCount() + config.DirectoryCount() == kMaxDenylistEntries);
+	assert(config.ReadSMC_KeyValue(nullptr, "last.smx", "1") == SMCResult_Continue);
+	assert(config.ReadSMC_KeyValue(nullptr, "disabled.smx", "0") == SMCResult_Continue);
+	assert(config.ReadSMC_KeyValue(nullptr, "overflow.smx", "1") == SMCResult_HaltFail);
+	assert(config.PluginCount() == 1 && config.DirectoryCount() == kMaxDenylistEntries - 1);
+	assert(config.Error().find("entries") != std::string::npos);
+	config.ReadSMC_ParseEnd(true, true);
+	assert(!config.IsComplete());
+
+	config.ReadSMC_ParseStart();
+	config.ReadSMC_NewSection(nullptr, "AutoloadPluginDenylist");
+	config.ReadSMC_NewSection(nullptr, "Directories");
+	size_t remaining_bytes = kMaxDenylistPathBytes;
+	size_t entry_index = 0;
+	while (remaining_bytes >= kMaxRelativePath)
+	{
+		std::string path = std::to_string(entry_index++);
+		path.resize(kMaxRelativePath, 'a');
+		assert(config.ReadSMC_KeyValue(nullptr, path.c_str(), "1") == SMCResult_Continue);
+		remaining_bytes -= path.size();
+	}
+	assert(remaining_bytes > 0);
+	const std::string last_path(remaining_bytes, 'z');
+	assert(config.ReadSMC_KeyValue(nullptr, last_path.c_str(), "1") == SMCResult_Continue);
+	assert(config.ReadSMC_KeyValue(nullptr, last_path.c_str(), "1") == SMCResult_Continue);
+	assert(config.ReadSMC_KeyValue(nullptr, "disabled", "0") == SMCResult_Continue);
+	assert(config.ReadSMC_KeyValue(nullptr, "q", "1") == SMCResult_HaltFail);
+	assert(config.Error().find("storage") != std::string::npos);
+	config.ReadSMC_ParseEnd(true, true);
+	assert(!config.IsComplete());
+
+	config.ReadSMC_ParseStart();
+	config.ReadSMC_NewSection(nullptr, "AutoloadPluginDenylist");
+	config.ReadSMC_NewSection(nullptr, "Plugins");
+	assert(config.ReadSMC_KeyValue(nullptr, "fresh.smx", "1") == SMCResult_Continue);
+	config.ReadSMC_LeavingSection(nullptr);
+	config.ReadSMC_LeavingSection(nullptr);
+	config.ReadSMC_ParseEnd(false, false);
+	assert(config.IsComplete() && config.PluginCount() == 1 && config.DirectoryCount() == 0);
+}
+
+void TestAddressArithmetic()
+{
+	const uintptr_t maximum_address = std::numeric_limits<uintptr_t>::max();
+	uintptr_t result;
+	assert(CheckedAddressAdd(0, 0, result) && result == 0);
+	assert(CheckedAddressAdd(maximum_address, 0, result) && result == maximum_address);
+	assert(CheckedAddressAdd(maximum_address - 1, 1, result) && result == maximum_address);
+	assert(!CheckedAddressAdd(maximum_address, 1, result));
+
+	ElfW(Phdr) segment{};
+	segment.p_type = PT_LOAD;
+	segment.p_vaddr = 1;
+	segment.p_memsz = 1;
+	segment.p_flags = PF_R | PF_X;
+	dl_phdr_info module{};
+	module.dlpi_addr = maximum_address;
+	module.dlpi_phdr = &segment;
+	module.dlpi_phnum = 1;
+	assert(!InSegment(module, 0, 1, PF_R));
+	module.dlpi_addr = maximum_address - 1;
+	assert(!InSegment(module, maximum_address, 1, PF_R));
+	module.dlpi_addr = 0;
+	assert(InSegment(module, 1, 1, PF_R | PF_X));
+	assert(InSegment(module, 2, 0, PF_R));
+	assert(!InSegment(module, 2, 1, PF_R));
+	assert(!InSegment(module, 0, 1, PF_R));
+	assert(!InSegment(module, 1, maximum_address, PF_R));
+	segment.p_type = PT_NOTE;
+	module.dlpi_addr = maximum_address;
+	assert(!HasSupportedBuildId(module));
+}
+
 void TestBinaryValidation()
 {
 	std::array<unsigned char, 36> notes{};
@@ -189,6 +309,9 @@ int main()
 	static_assert(sizeof(void *) == 4, "The ABI regression must run as i386");
 	TestPaths();
 	TestListener();
+	TestParserReuse();
+	TestConfigLimits();
+	TestAddressArithmetic();
 	TestBinaryValidation();
 	TestDetour();
 	std::puts("Path, config listener, binary validation, and i386 detour tests passed");

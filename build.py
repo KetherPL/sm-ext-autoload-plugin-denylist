@@ -64,7 +64,7 @@ def main():
     configs.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(project / "configs/autoload_plugin_denylist.cfg",
                     configs / "autoload_plugin_denylist.cfg")
-    for filename in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]:
+    for filename in ["README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]:
         shutil.copyfile(project / filename, output / "package" / filename)
     if arguments.test:
         tests = output / "denylist_tests"

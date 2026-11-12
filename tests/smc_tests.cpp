@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 SMGlobalClass *SMGlobalClass::head = nullptr;
 SourceMod::IShareSys *sharesys = nullptr;
@@ -50,5 +51,19 @@ int main(int argc, char **argv)
 			&states, error, sizeof(error));
 		assert(result != SourceMod::SMCError_Okay || !config.IsComplete());
 	}
+	std::string entries = "\"AutoloadPluginDenylist\"\n{\n\"Plugins\"\n{\n";
+	for (size_t index = 0; index < AutoloadDenylist::kMaxDenylistEntries; index++)
+		entries += "\"plugin" + std::to_string(index) + ".smx\" \"1\"\n";
+	const std::string at_limit = entries + "}\n}\n";
+	assert(parser.ParseSMCStream(at_limit.c_str(), at_limit.size(), &config, &states,
+		error, sizeof(error)) == SourceMod::SMCError_Okay);
+	assert(config.IsComplete() && config.PluginCount() == AutoloadDenylist::kMaxDenylistEntries);
+	const std::string over_limit = entries + "\"overflow.smx\" \"1\"\n}\n}\n";
+	assert(parser.ParseSMCStream(over_limit.c_str(), over_limit.size(), &config, &states,
+		error, sizeof(error)) != SourceMod::SMCError_Okay);
+	assert(!config.IsComplete() && config.Error().find("entries") != std::string::npos);
+	assert(parser.ParseSMCStream(valid, std::strlen(valid), &config, &states,
+		error, sizeof(error)) == SourceMod::SMCError_Okay);
+	assert(config.IsComplete() && config.PluginCount() == 1 && config.DirectoryCount() == 1);
 	std::puts("SourceMod SMC parser integration tests passed");
 }

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <link.h>
+#include <limits>
 
 namespace AutoloadDenylist
 {
@@ -26,6 +27,14 @@ inline constexpr std::array<unsigned char, 16> kEntryBytes = {
 	0x2c, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x5b, 0x81
 };
 
+inline bool CheckedAddressAdd(uintptr_t base, uintptr_t offset, uintptr_t &result)
+{
+	if (offset > std::numeric_limits<uintptr_t>::max() - base)
+		return false;
+	result = base + offset;
+	return true;
+}
+
 inline bool InSegment(const dl_phdr_info &module, uintptr_t address, size_t length,
 	unsigned int required_flags)
 {
@@ -34,9 +43,12 @@ inline bool InSegment(const dl_phdr_info &module, uintptr_t address, size_t leng
 		const auto &segment = module.dlpi_phdr[index];
 		if (segment.p_type != PT_LOAD || (segment.p_flags & required_flags) != required_flags)
 			continue;
-		const uintptr_t start = module.dlpi_addr + segment.p_vaddr;
-		if (address >= start && address - start <= segment.p_memsz &&
-			length <= segment.p_memsz - (address - start))
+		uintptr_t start;
+		uintptr_t end;
+		if (!CheckedAddressAdd(module.dlpi_addr, segment.p_vaddr, start) ||
+			!CheckedAddressAdd(start, segment.p_memsz, end))
+			continue;
+		if (address >= start && address <= end && length <= end - address)
 			return true;
 	}
 	return false;
@@ -47,8 +59,10 @@ inline bool HasSupportedBuildId(const dl_phdr_info &module)
 	for (size_t index = 0; index < module.dlpi_phnum; index++)
 	{
 		const auto &segment = module.dlpi_phdr[index];
-		const uintptr_t address = module.dlpi_addr + segment.p_vaddr;
-		if (segment.p_type != PT_NOTE || !InSegment(module, address, segment.p_memsz, PF_R))
+		uintptr_t address;
+		if (segment.p_type != PT_NOTE ||
+			!CheckedAddressAdd(module.dlpi_addr, segment.p_vaddr, address) ||
+			!InSegment(module, address, segment.p_memsz, PF_R))
 			continue;
 		const auto *notes = reinterpret_cast<const unsigned char *>(address);
 		size_t offset = 0;

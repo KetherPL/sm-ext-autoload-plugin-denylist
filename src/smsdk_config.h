@@ -3,7 +3,7 @@
 
 #define SMEXT_CONF_NAME "Autoload Plugin Denylist"
 #define SMEXT_CONF_DESCRIPTION "Excludes configured plugins and directory trees from automatic loading"
-#define SMEXT_CONF_VERSION "1.0.0"
+#define SMEXT_CONF_VERSION "1.0.1"
 #define SMEXT_CONF_AUTHOR "Kether.pl"
 #define SMEXT_CONF_URL "https://kether.pl"
 #define SMEXT_CONF_LOGTAG "AUTOLOAD_DENYLIST"

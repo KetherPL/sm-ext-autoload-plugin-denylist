@@ -51,7 +51,7 @@ int main(int argc, char **argv)
 	auto factory = reinterpret_cast<GetExtensionAPI>(dlsym(extension, "GetSMExtAPI"));
 	assert(factory);
 	auto *api = factory();
-	assert(api && std::strcmp(api->GetExtensionVerString(), "1.0.0") == 0);
+	assert(api && std::strcmp(api->GetExtensionVerString(), "1.0.1") == 0);
 	assert(std::strcmp(api->GetExtensionName(), "Autoload Plugin Denylist") == 0);
 	dlclose(extension);
 	std::puts("Supplied SourceMod binary: build ID, loader ABI entry, scan call site, detour installation/restoration passed");

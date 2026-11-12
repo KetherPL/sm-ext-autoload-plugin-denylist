@@ -78,6 +78,11 @@ Unknown, repeated, or nested sections and values other than `0`/`1` are errors.
 Duplicate enabled paths collapse into one entry. Either list may be omitted or
 empty. The outer `AutoloadPluginDenylist` section is required.
 
+Across both lists, at most 16,384 unique enabled entries and 8 MiB of normalized
+path text may be stored. Duplicate enabled paths and disabled entries do not
+consume additional storage budget. Exceeding either limit is a config error and
+prevents the extension from loading; no partial denylist is activated.
+
 Every skipped plugin is logged through SourceMod. SourceMod's existing `disabled`
 and `optional` directory rules continue to apply. Directory entries filter files
 found in those trees; they do not prevent filesystem traversal or resolve symlinks

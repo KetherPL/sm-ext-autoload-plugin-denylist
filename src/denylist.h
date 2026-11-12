@@ -9,6 +9,8 @@
 namespace AutoloadDenylist
 {
 constexpr size_t kMaxRelativePath = 4095;
+constexpr size_t kMaxDenylistEntries = 16384;
+constexpr size_t kMaxDenylistPathBytes = 8 * 1024 * 1024;
 
 inline bool NormalizePath(const char *input, bool directory, std::string &normalized)
 {
@@ -59,6 +61,8 @@ public:
 		root_seen_ = false;
 		plugins_seen_ = false;
 		directories_seen_ = false;
+		in_directories_ = false;
+		stored_path_bytes_ = 0;
 		complete_ = false;
 	}
 
@@ -91,7 +95,18 @@ public:
 		if (!NormalizePath(key, in_directories_, normalized))
 			return Fail("Invalid relative path (plugins require a .smx suffix)");
 		if (std::strcmp(value, "1") == 0)
-			(in_directories_ ? directories_ : plugins_).insert(std::move(normalized));
+		{
+			auto &entries = in_directories_ ? directories_ : plugins_;
+			if (entries.count(normalized))
+				return SourceMod::SMCResult_Continue;
+			if (plugins_.size() + directories_.size() >= kMaxDenylistEntries)
+				return Fail("Too many enabled denylist entries (maximum 16384 across both sections)");
+			if (normalized.size() > kMaxDenylistPathBytes - stored_path_bytes_)
+				return Fail("Enabled denylist paths exceed the 8 MiB storage limit");
+			const size_t path_bytes = normalized.size();
+			entries.insert(std::move(normalized));
+			stored_path_bytes_ += path_bytes;
+		}
 		return SourceMod::SMCResult_Continue;
 	}
 
@@ -141,6 +156,7 @@ private:
 	std::unordered_set<std::string> plugins_;
 	std::unordered_set<std::string> directories_;
 	std::string error_;
+	size_t stored_path_bytes_ = 0;
 	unsigned int depth_ = 0;
 	bool root_seen_ = false;
 	bool plugins_seen_ = false;
