@@ -63,12 +63,17 @@ public:
 
 	void SDK_OnUnload() override
 	{
+		ResetHook();
+	}
+
+private:
+	void ResetHook()
+	{
 		hook.reset();
 		target = {};
 	}
 
-private:
-	bool Load(char *error, size_t maxlength)
+	bool LoadConfig(char *error, size_t maxlength)
 	{
 		char config_path[PLATFORM_MAX_PATH];
 		smutils->BuildPath(Path_SM, config_path, sizeof(config_path), "configs/autoload_plugin_denylist.cfg");
@@ -83,6 +88,11 @@ private:
 			return false;
 		}
 
+		return true;
+	}
+
+	bool CheckPathReader(char *error, size_t maxlength)
+	{
 		AutoloadDenylist::ScanPathBuffer reader_probe;
 		constexpr char kReaderProbe[] = "autoload_plugin_denylist.smx";
 		if (!AutoloadDenylist::ReadScanPluginPath(reinterpret_cast<uintptr_t>(kReaderProbe), reader_probe))
@@ -91,22 +101,23 @@ private:
 			return false;
 		}
 
-		char logic_path[PLATFORM_MAX_PATH];
-		smutils->BuildPath(Path_SM, logic_path, sizeof(logic_path), "bin/sourcemod.logic.so");
-		auto close_module = [](void *handle) { dlclose(handle); };
-		std::unique_ptr<void, decltype(close_module)> module(dlopen(logic_path, RTLD_NOW | RTLD_NOLOAD), close_module);
-		if (!module)
-		{
-			std::snprintf(error, maxlength, "Cannot access already loaded sourcemod.logic.so: %s", dlerror());
-			return false;
-		}
+		return true;
+	}
+
+	bool DiscoverScanTarget(void *module_handle, char *error, size_t maxlength)
+	{
 		std::string discovery_error;
-		if (!AutoloadDenylist::DiscoverTarget(module.get(), target, discovery_error))
+		if (!AutoloadDenylist::DiscoverTarget(module_handle, target, discovery_error))
 		{
 			std::snprintf(error, maxlength, "Cannot validate automatic scan: %s; no hook installed", discovery_error.c_str());
 			return false;
 		}
 
+		return true;
+	}
+
+	bool InstallHook(char *error, size_t maxlength)
+	{
 		auto created = safetyhook::MidHook::create(target.call, &FilterAutomaticCall, safetyhook::MidHook::StartDisabled);
 		if (!created)
 		{
@@ -118,20 +129,38 @@ private:
 		if (hook.original_bytes().size() != AutoloadDenylist::kRelativeCallSize ||
 			std::memcmp(hook.original_bytes().data(), target.call, AutoloadDenylist::kRelativeCallSize) != 0)
 		{
-			hook.reset();
-			target = {};
+			ResetHook();
 			std::snprintf(error, maxlength, "Scan mid-hook does not preserve exactly the validated call instruction");
 			return false;
 		}
 		const auto enabled = hook.enable();
 		if (!enabled)
 		{
-			hook.reset();
-			target = {};
+			ResetHook();
 			std::snprintf(error, maxlength, "Cannot enable scan mid-hook (SafetyHook error %u)",
 				static_cast<unsigned int>(enabled.error().type));
 			return false;
 		}
+		return true;
+	}
+
+	bool Load(char *error, size_t maxlength)
+	{
+		if (!LoadConfig(error, maxlength) || !CheckPathReader(error, maxlength))
+			return false;
+
+		char logic_path[PLATFORM_MAX_PATH];
+		smutils->BuildPath(Path_SM, logic_path, sizeof(logic_path), "bin/sourcemod.logic.so");
+		auto close_module = [](void *handle) { dlclose(handle); };
+		std::unique_ptr<void, decltype(close_module)> module(dlopen(logic_path, RTLD_NOW | RTLD_NOLOAD), close_module);
+		if (!module)
+		{
+			std::snprintf(error, maxlength, "Cannot access already loaded sourcemod.logic.so: %s", dlerror());
+			return false;
+		}
+		if (!DiscoverScanTarget(module.get(), error, maxlength) || !InstallHook(error, maxlength))
+			return false;
+
 		smutils->LogMessage(myself, "Autoload filter enabled at discovered scan call +0x%zx: %zu plugins, %zu directory trees",
 			static_cast<size_t>(target.call - target.scanner), denylist.PluginCount(), denylist.DirectoryCount());
 		return true;

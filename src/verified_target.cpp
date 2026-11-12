@@ -68,6 +68,40 @@ size_t InstructionAt(const std::vector<Instruction> &instructions, size_t offset
 	return found != instructions.end() && found->offset == offset ? size_t(found - instructions.begin()) : instructions.size();
 }
 
+bool VerifyResultSlot(const std::vector<Instruction> &instructions, size_t result_push_index,
+	size_t adjustment, size_t &setup_start)
+{
+	const auto &result = instructions[result_push_index].operands[0];
+	// The result argument must be the address of a zero-initialized local slot.
+	int64_t result_slot = 0;
+	for (size_t index = result_push_index; index-- > adjustment;)
+	{
+		const auto &instruction = instructions[index];
+		if (!Register(instruction.operands[0], result.reg.value))
+			continue;
+		if (instruction.decoded.mnemonic != ZYDIS_MNEMONIC_LEA ||
+			instruction.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			instruction.operands[1].mem.base != ZYDIS_REGISTER_EBP ||
+			instruction.operands[1].mem.index != ZYDIS_REGISTER_NONE || instruction.operands[1].mem.disp.value >= 0)
+			return false;
+		result_slot = instruction.operands[1].mem.disp.value;
+		break;
+	}
+	bool initialized = false;
+	for (size_t distance = 1; result_slot && distance <= 3 && distance <= adjustment; distance++)
+	{
+		const auto &instruction = instructions[adjustment - distance];
+		if (instruction.decoded.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			Memory(instruction.operands[0], ZYDIS_REGISTER_EBP, result_slot))
+		{
+			initialized = Immediate(instruction.operands[1], 0);
+			setup_start = adjustment - distance;
+			break;
+		}
+	}
+	return initialized;
+}
+
 bool VerifyArguments(const std::vector<Instruction> &instructions, size_t call_index,
 	uint64_t &cleanup_bytes, size_t &setup_start)
 {
@@ -109,33 +143,7 @@ bool VerifyArguments(const std::vector<Instruction> &instructions, size_t call_i
 		Register(path, ZYDIS_REGISTER_EBP) || (pushes.size() == 4 && !Immediate(instructions[pushes[3]].operands[0], 0)))
 		return false;
 
-	// The result argument must be the address of a zero-initialized local slot.
-	int64_t result_slot = 0;
-	for (size_t index = pushes[1]; index-- > adjustment;)
-	{
-		const auto &instruction = instructions[index];
-		if (!Register(instruction.operands[0], result.reg.value))
-			continue;
-		if (instruction.decoded.mnemonic != ZYDIS_MNEMONIC_LEA ||
-			instruction.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
-			instruction.operands[1].mem.base != ZYDIS_REGISTER_EBP ||
-			instruction.operands[1].mem.index != ZYDIS_REGISTER_NONE || instruction.operands[1].mem.disp.value >= 0)
-			return false;
-		result_slot = instruction.operands[1].mem.disp.value;
-		break;
-	}
-	bool initialized = false;
-	for (size_t distance = 1; result_slot && distance <= 3 && distance <= adjustment; distance++)
-	{
-		const auto &instruction = instructions[adjustment - distance];
-		if (instruction.decoded.mnemonic == ZYDIS_MNEMONIC_MOV &&
-			Memory(instruction.operands[0], ZYDIS_REGISTER_EBP, result_slot))
-		{
-			initialized = Immediate(instruction.operands[1], 0);
-			setup_start = adjustment - distance;
-			break;
-		}
-	}
+	const bool initialized = VerifyResultSlot(instructions, pushes[1], adjustment, setup_start);
 	cleanup_bytes = instructions[adjustment].operands[1].imm.value.u + pushes.size() * sizeof(uint32_t);
 	return initialized && cleanup_bytes == 32;
 }
@@ -213,36 +221,43 @@ bool VerifySkipPath(const TargetCheck &target, const std::vector<Instruction> &i
 	}
 	return false;
 }
+
+bool Fail(std::string &error, const char *message)
+{
+	error = message;
+	return false;
 }
 
-bool ValidateScanCode(TargetCheck &target, std::string &error)
+bool DecodeScanner(const TargetCheck &target, std::vector<Instruction> &instructions, std::string &error)
 {
-	target.call = nullptr;
-	target.resume_address = 0;
-	auto fail = [&error](const char *message) { error = message; return false; };
 	if (!target.scanner || !target.loader || !target.scanner_size || target.scanner_size > kMaxScannerBytes)
-		return fail("Invalid scanner function range");
+		return Fail(error, "Invalid scanner function range");
 	uintptr_t end;
 	if (!CheckedAddressAdd(reinterpret_cast<uintptr_t>(target.scanner), target.scanner_size, end))
-		return fail("Scanner function range overflows");
+		return Fail(error, "Scanner function range overflows");
 	ZydisDecoder decoder;
 	if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32)))
-		return fail("Cannot initialize i386 instruction decoder");
-	std::vector<Instruction> instructions;
+		return Fail(error, "Cannot initialize i386 instruction decoder");
 	for (size_t offset = 0; offset < target.scanner_size;)
 	{
 		if (instructions.size() == kMaxDecodedInstructions)
-			return fail("Scanner exceeds instruction-count limit");
+			return Fail(error, "Scanner exceeds instruction-count limit");
 		Instruction instruction{};
 		instruction.offset = offset;
 		if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, target.scanner + offset,
 			target.scanner_size - offset, &instruction.decoded, instruction.operands.data())) ||
 			!instruction.decoded.length || instruction.decoded.length > target.scanner_size - offset)
-			return fail("Cannot decode complete scanner function");
+			return Fail(error, "Cannot decode complete scanner function");
 		offset += instruction.decoded.length;
 		instructions.push_back(instruction);
 	}
-	size_t call_index = instructions.size();
+	return true;
+}
+
+bool FindLoaderCall(const TargetCheck &target, const std::vector<Instruction> &instructions,
+	size_t &call_index, std::string &error)
+{
+	call_index = instructions.size();
 	for (size_t index = 0; index < instructions.size(); index++)
 	{
 		const auto &instruction = instructions[index];
@@ -251,37 +266,56 @@ bool ValidateScanCode(TargetCheck &target, std::string &error)
 			!RelativeTarget(target, instruction, address) || address != reinterpret_cast<uintptr_t>(target.loader))
 			continue;
 		if (call_index != instructions.size())
-			return fail("Scanner contains multiple loader calls");
+			return Fail(error, "Scanner contains multiple loader calls");
 		if (instruction.decoded.length != kRelativeCallSize || target.scanner[instruction.offset] != 0xe8)
-			return fail("Unrecognized loader call encoding");
+			return Fail(error, "Unrecognized loader call encoding");
 		call_index = index;
 	}
 	if (call_index == instructions.size())
-		return fail("Scanner has no direct call to the internal loader");
-	const uintptr_t call_address = reinterpret_cast<uintptr_t>(target.scanner) + instructions[call_index].offset;
+		return Fail(error, "Scanner has no direct call to the internal loader");
+	return true;
+}
+
+bool VerifyBranchEntries(const TargetCheck &target, const std::vector<Instruction> &instructions,
+	uintptr_t start_exclusive, uintptr_t end_exclusive, std::string &error, const char *message)
+{
 	for (const auto &instruction : instructions)
 	{
 		uintptr_t address;
 		if ((instruction.decoded.meta.category == ZYDIS_CATEGORY_COND_BR ||
 			instruction.decoded.meta.category == ZYDIS_CATEGORY_UNCOND_BR) &&
-			RelativeTarget(target, instruction, address) && address > call_address && address < call_address + kRelativeCallSize)
-			return fail("A branch enters the middle of the loader call");
+			RelativeTarget(target, instruction, address) && address > start_exclusive && address < end_exclusive)
+			return Fail(error, message);
 	}
+	return true;
+}
+
+}
+
+bool ValidateScanCode(TargetCheck &target, std::string &error)
+{
+	target.call = nullptr;
+	target.resume_address = 0;
+	std::vector<Instruction> instructions;
+	if (!DecodeScanner(target, instructions, error))
+		return false;
+	size_t call_index;
+	if (!FindLoaderCall(target, instructions, call_index, error))
+		return false;
+	const uintptr_t call_address = reinterpret_cast<uintptr_t>(target.scanner) + instructions[call_index].offset;
+	if (!VerifyBranchEntries(target, instructions, call_address, call_address + kRelativeCallSize,
+		error, "A branch enters the middle of the loader call"))
+		return false;
 	uint64_t cleanup_bytes;
 	size_t setup_start = 0;
 	if (!VerifyArguments(instructions, call_index, cleanup_bytes, setup_start))
-		return fail("Unrecognized scanner argument setup");
+		return Fail(error, "Unrecognized scanner argument setup");
 	const uintptr_t setup_address = reinterpret_cast<uintptr_t>(target.scanner) + instructions[setup_start].offset;
-	for (const auto &instruction : instructions)
-	{
-		uintptr_t address;
-		if ((instruction.decoded.meta.category == ZYDIS_CATEGORY_COND_BR ||
-			instruction.decoded.meta.category == ZYDIS_CATEGORY_UNCOND_BR) &&
-			RelativeTarget(target, instruction, address) && address > setup_address && address <= call_address)
-			return fail("A branch bypasses validated argument initialization");
-	}
+	if (!VerifyBranchEntries(target, instructions, setup_address, call_address + 1,
+		error, "A branch bypasses validated argument initialization"))
+		return false;
 	if (!VerifySkipPath(target, instructions, call_index, cleanup_bytes))
-		return fail("Cannot verify that a denied load resumes directory iteration");
+		return Fail(error, "Cannot verify that a denied load resumes directory iteration");
 	target.call = reinterpret_cast<unsigned char *>(call_address);
 	target.resume_address = call_address + kRelativeCallSize;
 	error.clear();

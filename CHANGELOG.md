@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.1 — 2026-11-12
+
+- Refactored extension initialization with Extract Method for config loading,
+  path-reader checks, target discovery, and hook installation. Consolidated
+  repeated hook cleanup in one method while preserving initialization order
+  and the logic module handle's lifetime.
+- Refactored ELF reading with Extract Method for header validation, file/module
+  identity checks, function-symbol parsing, and executable-range resolution.
+- Refactored scanner validation with Extract Method for result-slot validation,
+  instruction decoding, unique loader-call discovery, and shared branch-entry
+  checks.
+- Preserved filtering behavior, configuration, validation policy, diagnostics,
+  public interfaces, and the per-plugin filtering path. Pre/post-refactor
+  characterization matched 2,863 scanner cases and 879 ELF cases, including exact
+  diagnostic text. Regression tests passedagainst i386 SourceMod 1.12 builds 7028, 7230, and 7260.
+
 ## 2.0.0 — 2026-11-12
 
 - Copy scan candidates into an owned, bounded buffer with Linux

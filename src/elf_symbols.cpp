@@ -79,12 +79,11 @@ bool ReadBuildId(const unsigned char *notes, size_t size, std::vector<unsigned c
 	return false;
 }
 
-bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info &module,
-	TargetCheck &target, std::string &error)
+namespace
 {
-	target = {};
-	error.clear();
-	ElfW(Ehdr) header;
+bool ReadImageHeader(const std::vector<unsigned char> &image, const dl_phdr_info &module,
+	ElfW(Ehdr) &header, std::string &error)
+{
 	if (image.size() > kMaxLogicFileBytes || !ReadValue(image, 0, header) ||
 		std::memcmp(header.e_ident, ELFMAG, SELFMAG) != 0 ||
 		header.e_ident[EI_CLASS] != ELFCLASS32 || header.e_ident[EI_DATA] != ELFDATA2LSB ||
@@ -97,6 +96,12 @@ bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info
 		!FileRange(image, header.e_shoff, size_t(header.e_shnum) * sizeof(ElfW(Shdr))))
 		return Fail(error, "Invalid, unsupported, or truncated Linux i386 ELF metadata");
 
+	return true;
+}
+
+bool VerifyModuleIdentity(const std::vector<unsigned char> &image, const dl_phdr_info &module,
+	const ElfW(Ehdr) &header, std::string &error)
+{
 	bool identity_matches = false;
 	for (size_t index = 0; index < header.e_phnum; index++)
 	{
@@ -124,8 +129,12 @@ bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info
 	if (!identity_matches)
 		return Fail(error, "Cannot establish logic file/loaded module identity without a GNU build ID");
 
-	ElfW(Sym) scanner_symbol{};
-	ElfW(Sym) loader_symbol{};
+	return true;
+}
+
+bool ReadFunctionSymbols(const std::vector<unsigned char> &image, const ElfW(Ehdr) &header,
+	ElfW(Sym) &scanner_symbol, ElfW(Sym) &loader_symbol, std::string &error)
+{
 	for (size_t index = 0; index < header.e_shnum; index++)
 	{
 		ElfW(Shdr) symbols;
@@ -161,6 +170,12 @@ bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info
 			*selected = symbol;
 		}
 	}
+	return true;
+}
+
+bool ResolveFunctionRanges(const dl_phdr_info &module, const ElfW(Sym) &scanner_symbol,
+	const ElfW(Sym) &loader_symbol, TargetCheck &target, std::string &error)
+{
 	uintptr_t scanner_address;
 	uintptr_t loader_address;
 	if (!scanner_symbol.st_size || scanner_symbol.st_size > kMaxScannerBytes ||
@@ -174,6 +189,21 @@ bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info
 	target.scanner = reinterpret_cast<unsigned char *>(scanner_address);
 	target.scanner_size = scanner_symbol.st_size;
 	return true;
+}
+}
+
+bool ReadTargetImage(const std::vector<unsigned char> &image, const dl_phdr_info &module,
+	TargetCheck &target, std::string &error)
+{
+	target = {};
+	error.clear();
+	ElfW(Ehdr) header;
+	ElfW(Sym) scanner_symbol{};
+	ElfW(Sym) loader_symbol{};
+	return ReadImageHeader(image, module, header, error) &&
+		VerifyModuleIdentity(image, module, header, error) &&
+		ReadFunctionSymbols(image, header, scanner_symbol, loader_symbol, error) &&
+		ResolveFunctionRanges(module, scanner_symbol, loader_symbol, target, error);
 }
 
 bool DiscoverTarget(void *module_handle, TargetCheck &target, std::string &error)

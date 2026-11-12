@@ -117,7 +117,7 @@ int main(int argc, char **argv)
 	auto factory = reinterpret_cast<GetExtensionAPI>(dlsym(extension, "GetSMExtAPI"));
 	assert(factory);
 	auto *api = factory();
-	assert(api && std::strcmp(api->GetExtensionVerString(), "2.0.0") == 0);
+	assert(api && std::strcmp(api->GetExtensionVerString(), "2.0.1") == 0);
 	assert(std::strcmp(api->GetExtensionName(), "Autoload Plugin Denylist") == 0);
 	dlclose(extension);
 	std::printf("%s: automatic discovery +0x%zx, ELF rejection cases, mid-hook restoration, and extension API passed\n",
