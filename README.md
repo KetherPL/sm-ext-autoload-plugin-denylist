@@ -15,8 +15,8 @@ python3 build.py --sourcemod /kesz/Budowanie/alliedmodders/sourcemod --test \
   --logic /home/starterx4/Pulpit/gity/Kether.pl-L4D2-Server/addons/sourcemod/bin/sourcemod.logic.so
 ```
 
-Output: `build/package/addons/sourcemod/`. `--logic` is optional and used only with
-`--test`. It loads the specified binary into a standalone test process and verifies
+Output: `build/package/addons/sourcemod/`. `--logic` is optional, repeatable, and
+used only with `--test`. It loads the specified binary into a standalone test process and verifies
 the target, installs a temporary detour, and verifies restoration. It does not
 connect to or modify a running server or change the input binary on disk.
 
@@ -90,56 +90,75 @@ to canonical disk locations. Dependencies and explicit plugin loads can still
 load a denied filename because they do not originate at the automatic scan call.
 This is a startup selection tool, not a security boundary for untrusted plugins.
 
-## Verified binary and hook
+## Runtime compatibility and hook
 
-Supported `sourcemod.logic.so` GNU build ID:
+The extension discovers its hook location at startup. It has no per-build address
+map, fixed scan offset, loader prologue signature, or build-ID allowlist. Compatible
+SourceMod updates can work with the same extension binary.
 
-```text
-a1542916a00679cbc72a6c25b5860c8d0a69c3d2
-```
+The Linux i386 logic binaries tested are 1.12.0.7028, 1.12.0.7230, and 1.12.0.7260.
+Their scan call offsets differ, and the older builds supply an extra argument that
+7260 omits. All three inline `CPluginManager::LoadAutoPlugin` into the directory
+scanner, so hooking the standalone `LoadAutoPlugin` symbol would miss the scan.
 
-The supplied optimized binary inlines `CPluginManager::LoadAutoPlugin` into
-`LoadPluginsFromDir`; the standalone `LoadAutoPlugin` symbol has no scan caller.
-A detour on that symbol would therefore miss automatic loads.
+At initialization, the extension:
 
-Instead, this extension detours the internal `LoadPlugin` function and filters
-only calls whose return address is the verified automatic scan call site.
-The original loader handles every other call unchanged. This build removes the
-unused `debug` and `type` arguments internally: the verified call ABI is
-`int(void *manager, void **result, const char *path)`. A denied call returns
-`LoadRes_NeverLoad` (3), which the scanner skips without creating a plugin or
-calling `AddPlugin`.
+1. Reads the already loaded logic module's ELF symbol table to obtain bounded
+   function ranges for `LoadPluginsFromDir` and its internal `LoadPlugin` target.
+2. Checks the ELF architecture, metadata bounds, executable ranges, program headers,
+   and GNU build ID. The file and loaded image must match; the build ID establishes
+   their identity rather than restricting which SourceMod release is accepted.
+3. Decodes the scanner with Zydis and requires exactly one direct loader call on
+   instruction boundaries, with no branch entering the middle of that call.
+4. Validates a frame-based cdecl push sequence whose first arguments are the plugin
+   manager, a zero-initialized result slot, and plugin path. Both observed three-
+   and four-argument forms are recognized.
+5. Checks the result-handling instructions to establish that `LoadRes_NeverLoad`
+   (3) skips plugin processing and resumes the directory's `NextEntry` iteration.
+6. Installs a SafetyHook mid-function hook over exactly that five-byte call.
 
-Runtime validation requires the exact loaded module build ID, both internal
-symbols, readable/executable address ranges, expected loader entry bytes, the
-scanner's argument setup bytes, and a direct call to that loader at scanner
-offset `0x416` (return offset `0x41b`). SafetyHook from the SourceMod checkout
-creates/restores the trampoline. Unloading the extension removes the hook.
+Allowed loads execute the original call with its arguments and registers intact.
+Denied loads skip that call and resume immediately afterward with result 3, allowing
+SourceMod to clean up its argument stack and continue scanning. The internal loader
+itself is unchanged, so explicit and dependency loads remain available. Unloading
+this extension restores the original call instruction.
 
-An unsupported or stripped binary, changed code, missing/malformed config, or
-hook error prevents this extension from loading. SourceMod itself can continue
-loading plugins without filtering: inspect extension status and SourceMod error
-logs after startup. Do not assume exclusions took effect when the extension
-failed to load.
+This remains a conservative machine-code validator, not a guarantee for arbitrary
+future compilers or SourceMod internals. Unrecognized stack layouts, result dispatch,
+missing/stripped symbols, ambiguous calls, file/image mismatch, malformed config,
+or hook errors prevent the extension from loading. Windows and x86-64 remain
+unsupported. The archived x64 binary is tested only for architecture rejection.
 
-Other SourceMod builds, Windows, and x86-64 are unsupported. Updating the target
-requires fresh disassembly and ABI/call-site validation, followed by updating
-`src/verified_target.h` and rerunning the binary tests. Changing only the build ID
-does not establish compatibility.
+If discovery rejects a future update, inspect that build before expanding the
+validator. Do not bypass the checks. Update SourceMod while the server is stopped;
+restart after replacing its binaries so the loaded code and file agree.
+
+SourceMod itself can continue loading plugins if this extension fails. Check the
+extension status and SourceMod error logs after startup; a failed extension means
+the filter is inactive.
 
 ## Validation
 
-`--test` checks path normalization, exact matches, recursive directory boundaries,
-case sensitivity, disabled entries, invalid config events, real SourceMod SMC
-parsing, malformed ELF notes, mismatched binary rejection, and an executable
-i386 fixture that distinguishes automatic and manual callers and verifies hook
-restoration. `--logic` additionally validates the supplied real logic binary and
-its hook installation/restoration. Live-server startup and map changes have not
-been tested.
+`--test` checks path normalization, directory matching, config limits and parser
+reuse, actual SourceMod SMC parsing, checked address arithmetic, and bounded GNU
+build-ID parsing. Executable i386 fixtures check runtime call discovery, rejection
+of altered arguments and result handling, both observed argument counts, unchanged
+allowed-call context, automatic filtering, manual-load isolation, and restoration.
+
+Use repeated `--logic /path/to/sourcemod.logic.so` arguments with `--test` to check
+multiple binaries in separate standalone processes. These tests use the same ELF
+reader and instruction validator as the extension; no external symbol-offset
+arguments or `nm`-generated maps are needed. They also check malformed metadata,
+file/image mismatch, discovery rejection while a hook is installed, full scanner
+restoration, and the built extension's API. A supplied x64 binary is expected to
+be rejected by the i386 process.
+
+Real-binary tests install and restore hooks without executing SourceMod's plugin
+scan. Live-server startup and map changes remain untested.
 
 Source references: [SourceMod plugin loading](https://github.com/alliedmodders/sourcemod/blob/master/core/logic/PluginSys.cpp)
 and [extension-before-plugin startup order](https://github.com/alliedmodders/sourcemod/blob/master/core/sourcemod.cpp).
-The local source and supplied binary determine this extension's supported ABI.
+The validator recognizes the observed i386 call and result-handling layouts.
 
 ## License
 

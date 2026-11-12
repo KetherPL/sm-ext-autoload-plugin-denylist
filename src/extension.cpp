@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <smsdk_ext.h>
-#include <safetyhook/inline_hook.hpp>
+#include <safetyhook/mid_hook.hpp>
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <exception>
-#include "denylist.h"
-#include "verified_target.h"
+#include <memory>
+#include "scan_hook.h"
 
 #if !defined(__linux__) || !defined(__i386__)
 #error This verified hook supports Linux i386 only.
@@ -14,39 +15,24 @@
 
 namespace
 {
-// This exact optimized build passes only these three arguments. The unused
-// debug/type arguments in the source declaration were removed by the compiler.
-using InternalLoadPlugin = int (*)(void *manager, void **result, const char *plugin);
 AutoloadDenylist::Denylist denylist;
-safetyhook::InlineHook hook;
-InternalLoadPlugin original_load_plugin = nullptr;
-void *scan_return_address = nullptr;
+safetyhook::MidHook hook;
+AutoloadDenylist::TargetCheck target;
 
-__attribute__((noinline)) int FilterPluginLoad(void *manager, void **result, const char *plugin)
+void FilterAutomaticCall(safetyhook::Context &context)
 {
-	assert(original_load_plugin);
-	if (__builtin_extract_return_addr(__builtin_return_address(0)) != scan_return_address)
-		return original_load_plugin(manager, result, plugin);
+	assert(target.resume_address);
 	try
 	{
-		if (denylist.Blocks(plugin))
-		{
-			smutils->LogMessage(myself, "Skipped automatic plugin load: %s", plugin);
-			if (result)
-				*result = nullptr;
-			return AutoloadDenylist::kLoadNeverLoad;
-		}
+		if (AutoloadDenylist::FilterScanCall(context, denylist, target.resume_address))
+			smutils->LogMessage(myself, "Skipped automatic plugin load: %s", AutoloadDenylist::ScanPluginPath(context));
 	}
 	catch (const std::exception &exception)
 	{
-		// Do not leak C++ exceptions into SourceMod's plugin manager.
-		// Preserve exclusion on a failed matching operation.
+		// Preserve exclusion without allowing exceptions into SourceMod's scanner.
+		AutoloadDenylist::SkipScanCall(context, target.resume_address);
 		smutils->LogError(myself, "Skipped automatic load after matching error: %s", exception.what());
-		if (result)
-			*result = nullptr;
-		return AutoloadDenylist::kLoadNeverLoad;
 	}
-	return original_load_plugin(manager, result, plugin);
 }
 
 class AutoloadPluginDenylist final : public SDKExtension
@@ -73,8 +59,7 @@ public:
 	void SDK_OnUnload() override
 	{
 		hook.reset();
-		original_load_plugin = nullptr;
-		scan_return_address = nullptr;
+		target = {};
 	}
 
 private:
@@ -95,54 +80,47 @@ private:
 
 		char logic_path[PLATFORM_MAX_PATH];
 		smutils->BuildPath(Path_SM, logic_path, sizeof(logic_path), "bin/sourcemod.logic.so");
-		void *module = dlopen(logic_path, RTLD_NOW | RTLD_NOLOAD);
+		auto close_module = [](void *handle) { dlclose(handle); };
+		std::unique_ptr<void, decltype(close_module)> module(dlopen(logic_path, RTLD_NOW | RTLD_NOLOAD), close_module);
 		if (!module)
 		{
 			std::snprintf(error, maxlength, "Cannot access already loaded sourcemod.logic.so: %s", dlerror());
 			return false;
 		}
-		void *target = memutils->ResolveSymbol(module, AutoloadDenylist::kTargetSymbol);
-		void *scanner = memutils->ResolveSymbol(module, AutoloadDenylist::kScannerSymbol);
-		dlclose(module);
-		AutoloadDenylist::TargetCheck check{target, scanner};
-		if (target)
-			dl_iterate_phdr(AutoloadDenylist::CheckLoadedTarget, &check);
-		if (!check.verified)
+		std::string discovery_error;
+		if (!AutoloadDenylist::DiscoverTarget(module.get(), target, discovery_error))
 		{
-			std::snprintf(error, maxlength, "Unsupported SourceMod logic binary, missing symbols, or modified loader/scan call site; no hook installed");
+			std::snprintf(error, maxlength, "Cannot validate automatic scan: %s; no hook installed", discovery_error.c_str());
 			return false;
 		}
 
-		auto created = safetyhook::InlineHook::create(target, reinterpret_cast<void *>(&FilterPluginLoad),
-			safetyhook::InlineHook::Flags::StartDisabled);
+		auto created = safetyhook::MidHook::create(target.call, &FilterAutomaticCall, safetyhook::MidHook::StartDisabled);
 		if (!created)
 		{
-			std::snprintf(error, maxlength, "Cannot create LoadPlugin detour (SafetyHook error %u)",
+			std::snprintf(error, maxlength, "Cannot create scan mid-hook (SafetyHook error %u)",
 				static_cast<unsigned int>(created.error().type));
 			return false;
 		}
 		hook = std::move(created.value());
-		original_load_plugin = hook.original<InternalLoadPlugin>();
-		if (!original_load_plugin)
+		if (hook.original_bytes().size() != AutoloadDenylist::kRelativeCallSize ||
+			std::memcmp(hook.original_bytes().data(), target.call, AutoloadDenylist::kRelativeCallSize) != 0)
 		{
 			hook.reset();
-			scan_return_address = nullptr;
-			std::snprintf(error, maxlength, "Cannot enable LoadPlugin detour: trampoline is null");
+			target = {};
+			std::snprintf(error, maxlength, "Scan mid-hook does not preserve exactly the validated call instruction");
 			return false;
 		}
-		scan_return_address = check.scan_return_address;
 		const auto enabled = hook.enable();
 		if (!enabled)
 		{
 			hook.reset();
-			original_load_plugin = nullptr;
-			scan_return_address = nullptr;
-			std::snprintf(error, maxlength, "Cannot enable LoadPlugin detour (SafetyHook error %u)",
+			target = {};
+			std::snprintf(error, maxlength, "Cannot enable scan mid-hook (SafetyHook error %u)",
 				static_cast<unsigned int>(enabled.error().type));
 			return false;
 		}
-		smutils->LogMessage(myself, "Autoload filter enabled: %zu plugins, %zu directory trees",
-			denylist.PluginCount(), denylist.DirectoryCount());
+		smutils->LogMessage(myself, "Autoload filter enabled at discovered scan call +0x%zx: %zu plugins, %zu directory trees",
+			static_cast<size_t>(target.call - target.scanner), denylist.PluginCount(), denylist.DirectoryCount());
 		return true;
 	}
 };

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "denylist.h"
 #include "verified_target.h"
-#include <safetyhook/inline_hook.hpp>
+#include <array>
+#include <algorithm>
+#include <cstring>
 #include <cassert>
 #include <cstdio>
 #include <vector>
@@ -197,111 +199,37 @@ void TestAddressArithmetic()
 	assert(!InSegment(module, 1, maximum_address, PF_R));
 	segment.p_type = PT_NOTE;
 	module.dlpi_addr = maximum_address;
-	assert(!HasSupportedBuildId(module));
+	assert(!InSegment(module, 0, 1, PF_R));
 }
 
 void TestBinaryValidation()
 {
+	std::array<unsigned char, 20> expected{};
+	for (size_t index = 0; index < expected.size(); index++)
+		expected[index] = static_cast<unsigned char>(index);
 	std::array<unsigned char, 36> notes{};
-	ElfW(Nhdr) note{4, kBuildId.size(), NT_GNU_BUILD_ID};
+	ElfW(Nhdr) note{4, expected.size(), NT_GNU_BUILD_ID};
 	std::memcpy(notes.data(), &note, sizeof(note));
 	std::memcpy(notes.data() + sizeof(note), "GNU\0", 4);
-	std::memcpy(notes.data() + sizeof(note) + 4, kBuildId.data(), kBuildId.size());
-	std::array<ElfW(Phdr), 2> segments{};
-	for (auto &segment : segments)
-	{
-		segment.p_vaddr = reinterpret_cast<uintptr_t>(notes.data());
-		segment.p_memsz = notes.size();
-		segment.p_flags = PF_R;
-	}
-	segments[0].p_type = PT_LOAD;
-	segments[1].p_type = PT_NOTE;
-	dl_phdr_info module{};
-	module.dlpi_phdr = segments.data();
-	module.dlpi_phnum = segments.size();
-	assert(HasSupportedBuildId(module));
+	std::memcpy(notes.data() + sizeof(note) + 4, expected.data(), expected.size());
+	std::vector<unsigned char> build_id;
+	assert(ReadBuildId(notes.data(), notes.size(), build_id));
+	assert(std::equal(build_id.begin(), build_id.end(), expected.begin(), expected.end()));
 	notes.back() ^= 1;
-	assert(!HasSupportedBuildId(module));
-	notes.back() ^= 1;
-	segments[1].p_memsz--;
-	assert(!HasSupportedBuildId(module));
-	segments[1].p_memsz++;
-	segments[0].p_flags = 0;
-	assert(!HasSupportedBuildId(module));
-	segments[0].p_flags = PF_R;
+	assert(ReadBuildId(notes.data(), notes.size(), build_id));
+	assert(build_id.back() != expected.back());
+	assert(!ReadBuildId(notes.data(), notes.size() - 1, build_id));
+	assert(build_id.empty());
 	note.n_namesz = UINT32_MAX;
 	std::memcpy(notes.data(), &note, sizeof(note));
-	assert(!HasSupportedBuildId(module));
-	TargetCheck check{reinterpret_cast<void *>(&TestBinaryValidation)};
-	dl_iterate_phdr(CheckLoadedTarget, &check);
-	assert(!check.verified);
+	assert(!ReadBuildId(notes.data(), notes.size(), build_id));
+	note.n_namesz = 4;
+	note.n_descsz = 0;
+	std::memcpy(notes.data(), &note, sizeof(note));
+	assert(!ReadBuildId(notes.data(), notes.size(), build_id));
+	assert(!ReadBuildId(nullptr, 0, build_id));
 }
 
-safetyhook::InlineHook test_hook;
-int calls = 0;
-void *last_manager = nullptr;
-std::string last_plugin;
-using InternalLoad = int (*)(void *, void **, const char *);
-
-// Match the supplied build's initial instructions and exercise the i386 member ABI.
-extern "C" int FixtureBody(void *manager, void **result, const char *plugin)
-{
-	calls++;
-	last_manager = manager;
-	last_plugin = plugin;
-	*result = manager;
-	return 0;
-}
-extern "C" int Fixture(void *, void **, const char *);
-extern "C" int FixtureScanner(void *, void **, const char *);
-extern "C" char FixtureScanReturn;
-asm(".text\n"
-	".global Fixture\n"
-	".type Fixture,@function\n"
-	"Fixture:\n"
-	"push %ebp\n mov %esp,%ebp\n push %ebx\n push %edi\n push %esi\n"
-	"push 16(%ebp)\n push 12(%ebp)\n push 8(%ebp)\n call FixtureBody\n add $12,%esp\n"
-	"pop %esi\n pop %edi\n pop %ebx\n leave\n ret\n"
-	".size Fixture,.-Fixture\n"
-	".global FixtureScanner\n .type FixtureScanner,@function\n"
-	"FixtureScanner:\n push %ebp\n mov %esp,%ebp\n sub $12,%esp\n"
-	"push 16(%ebp)\n push 12(%ebp)\n push 8(%ebp)\n call Fixture\n"
-	".global FixtureScanReturn\n FixtureScanReturn:\n add $12,%esp\n leave\n ret\n"
-	".size FixtureScanner,.-FixtureScanner\n");
-
-__attribute__((noinline)) int FixtureDetour(void *manager, void **result, const char *plugin)
-{
-	if (__builtin_extract_return_addr(__builtin_return_address(0)) == &FixtureScanReturn &&
-		std::strcmp(plugin, "blocked.smx") == 0)
-	{
-		*result = nullptr;
-		return kLoadNeverLoad;
-	}
-	return test_hook.original<InternalLoad>()(manager, result, plugin);
-}
-
-void TestDetour()
-{
-	std::array<unsigned char, kEntryBytes.size()> original;
-	std::memcpy(original.data(), reinterpret_cast<void *>(&Fixture), original.size());
-	auto created = safetyhook::InlineHook::create(reinterpret_cast<void *>(&Fixture),
-		reinterpret_cast<void *>(&FixtureDetour), safetyhook::InlineHook::Flags::StartDisabled);
-	assert(created);
-	test_hook = std::move(created.value());
-	assert(test_hook.enable());
-	int manager = 0;
-	void *result = &manager;
-	assert(FixtureScanner(&manager, &result, "blocked.smx") == kLoadNeverLoad);
-	assert(calls == 0 && result == nullptr);
-	assert(FixtureScanner(&manager, &result, "allowed.smx") == 0);
-	assert(calls == 1 && result == &manager && last_manager == &manager && last_plugin == "allowed.smx");
-	assert(Fixture(&manager, &result, "blocked.smx") == 0);
-	assert(calls == 2 && last_plugin == "blocked.smx");
-	test_hook.reset();
-	assert(std::memcmp(original.data(), reinterpret_cast<void *>(&Fixture), original.size()) == 0);
-	assert(FixtureScanner(&manager, &result, "blocked.smx") == 0);
-	assert(calls == 3 && last_plugin == "blocked.smx");
-}
 }
 
 int main()
@@ -313,6 +241,5 @@ int main()
 	TestConfigLimits();
 	TestAddressArithmetic();
 	TestBinaryValidation();
-	TestDetour();
-	std::puts("Path, config listener, binary validation, and i386 detour tests passed");
+	std::puts("Path, config, ELF note, and checked-address tests passed");
 }

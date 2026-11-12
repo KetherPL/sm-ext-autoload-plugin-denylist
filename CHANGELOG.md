@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Replaced the build-specific internal-loader detour with a mid-function hook at
+  the automatically discovered directory-scan call. Compatible updates no longer
+  require a new compiled build ID, loader entry signature, or scan offset.
+- Added bounded ELF symbol reading and file/loaded-image identity checks, full
+  instruction decoding, unique-call validation, argument-layout checks, and
+  validation that denied loads resume directory iteration.
+- Preserve SourceMod's original arguments for allowed loads, including both
+  observed three- and four-argument forms. Manual and dependency loads continue
+  to bypass the automatic-scan filter.
+- Added executable filtering and rejection fixtures and real-binary discovery and
+  hook-restoration tests for i386 SourceMod 1.12.0.7028, 1.12.0.7230, and 1.12.0.7260.
+  The archived x64 binary remains unsupported and is tested for rejection.
+- Made `build.py --logic` repeatable and removed external symbol-offset arguments
+  from the binary tests. Updated compatibility and validation documentation.
+
 ## 1.0.1 — 2026-11-12
 
 Changes since 1.0.0:

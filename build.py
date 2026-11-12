@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("build"))
     parser.add_argument("--debug", action="store_true", help="Include debug symbols and leave the extension unstripped")
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--logic", type=Path, help="With --test, validate and temporarily detour this logic binary in a standalone test process")
+    parser.add_argument("--logic", type=Path, action="append", default=[], help="With --test, validate a logic binary in a standalone process; repeat for multiple files")
     arguments = parser.parse_args()
     project = Path(__file__).resolve().parent
     sourcemod = arguments.sourcemod.resolve()
@@ -37,7 +37,8 @@ def main():
     include_flags = [f"-I{directory}" for directory in includes]
     cpp_flags = ["-std=c++17", "-fno-gnu-unique", "-Wall", "-Wextra", "-Wno-unused-parameter"]
     objects = []
-    sources = [project / "src/extension.cpp", public / "smsdk_ext.cpp"]
+    sources = [project / "src/extension.cpp", public / "smsdk_ext.cpp",
+               project / "src/verified_target.cpp", project / "src/elf_symbols.cpp"]
     sources += [safetyhook / "src" / filename for filename in
                 ["allocator.cpp", "easy.cpp", "inline_hook.cpp", "mid_hook.cpp",
                  "utility.cpp", "vmt_hook.cpp", "os.linux.cpp"]]
@@ -73,6 +74,12 @@ def main():
                         *[object_path for object_path in objects if not Path(object_path).name.startswith(("0_", "1_"))],
                         "-ldl", "-o", str(tests)], check=True)
         subprocess.run([str(tests)], check=True)
+        scan_tests = output / "scan_tests"
+        subprocess.run([compiler, *common_flags, *include_flags, *cpp_flags,
+                        str(project / "tests/scan_tests.cpp"),
+                        *[object_path for object_path in objects if not Path(object_path).name.startswith(("0_", "1_"))],
+                        "-ldl", "-o", str(scan_tests)], check=True)
+        subprocess.run([str(scan_tests)], check=True)
         smc_tests = output / "smc_tests"
         subprocess.run([compiler, *common_flags, *include_flags, *cpp_flags, "-DSM_LOGIC",
                         f"-I{sourcemod / 'core/logic'}", str(project / "tests/smc_tests.cpp"),
@@ -80,22 +87,13 @@ def main():
                         "-o", str(smc_tests)], check=True)
         subprocess.run([str(smc_tests), str(project / "configs/autoload_plugin_denylist.cfg")], check=True)
         if arguments.logic:
-            logic = arguments.logic.resolve()
-            symbols = {}
-            for line in subprocess.check_output(["nm", "--defined-only", "--format=posix", str(logic)], text=True).splitlines():
-                fields = line.split()
-                if len(fields) >= 3:
-                    symbols[fields[0]] = fields[2]
-            loader_symbol = "_ZN14CPluginManager10LoadPluginEPP7CPluginPKcbN9SourceMod10PluginTypeE"
-            scanner_symbol = "_ZN14CPluginManager18LoadPluginsFromDirEPKcS1_"
-            if loader_symbol not in symbols or scanner_symbol not in symbols:
-                parser.error("Logic binary lacks required loader/scanner symbols")
             logic_tests = output / "logic_tests"
             subprocess.run([compiler, *common_flags, *include_flags, *cpp_flags,
                             str(project / "tests/logic_tests.cpp"),
                             *[object_path for object_path in objects if not Path(object_path).name.startswith(("0_", "1_"))],
                             "-ldl", "-o", str(logic_tests)], check=True)
-            subprocess.run([str(logic_tests), str(logic), symbols[loader_symbol], symbols[scanner_symbol], str(library)], check=True)
+            for logic in arguments.logic:
+                subprocess.run([str(logic_tests), str(logic.resolve()), str(library)], check=True)
     print(f"Built {library}")
 
 

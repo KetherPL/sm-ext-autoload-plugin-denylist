@@ -10,5 +10,4 @@
 #define SMEXT_CONF_LICENSE "GPL-3.0-or-later"
 #define SMEXT_CONF_DATESTRING __DATE__
 #define SMEXT_LINK(name) SDKExtension *g_pExtensionIface = name;
-#define SMEXT_ENABLE_MEMUTILS
 #define SMEXT_ENABLE_TEXTPARSERS

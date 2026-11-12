@@ -47,7 +47,7 @@ jobs:
 
       - name: Build and test
         working-directory: src
-        # --logic requires the separately supplied, exact supported server binary.
+        # Optional --logic tests use separately supplied SourceMod binaries.
         run: python3 build.py --sourcemod ../sourcemod --test
 
       - name: Verify Linux binary and package
